@@ -317,32 +317,53 @@ module ActiveRecord
         # Reorders intermediate items to support moving an item from old_position to new_position.
         def shuffle_positions_on_intermediate_items(old_position, new_position, avoid_id = nil)
           return if old_position == new_position
-          scope = acts_as_list_list
+          scope = acts_as_list_list.select(:id)
 
           if avoid_id
             scope = scope.where("#{quoted_table_name}.#{self.class.primary_key} != ?", self.class.connection.quote(avoid_id))
           end
+
+          # unique constraint prevents regular increment_all and forces to do increments one by one
+          # http://stackoverflow.com/questions/7703196/sqlite-increment-unique-integer-field
+          # both SQLite and PostgreSQL (and most probably MySQL too) has same issue
+          update_one_by_one = acts_as_list_list.connection.index_exists?(acts_as_list_list.table_name, position_column, unique: true)
 
           if old_position < new_position
             # Decrement position of intermediate items
             #
             # e.g., if moving an item from 2 to 5,
             # move [3, 4, 5] to [2, 3, 4]
-            scope.where(
+            items = scope.where(
               "#{quoted_position_column_with_table_name} > ?", old_position
             ).where(
               "#{quoted_position_column_with_table_name} <= ?", new_position
-            ).decrement_all
+            )
+
+            if update_one_by_one
+              items.order("#{quoted_position_column_with_table_name} ASC").pluck(:id).each do |id|
+                acts_as_list_list.find(id).decrement!(position_column)
+              end
+            else
+              items.decrement_all
+            end
           else
             # Increment position of intermediate items
             #
             # e.g., if moving an item from 5 to 2,
             # move [2, 3, 4] to [3, 4, 5]
-            scope.where(
+            items = scope.where(
               "#{quoted_position_column_with_table_name} >= ?", new_position
             ).where(
               "#{quoted_position_column_with_table_name} < ?", old_position
-            ).increment_all
+            )
+
+            if update_one_by_one
+              items.order("#{quoted_position_column_with_table_name} DESC").pluck(:id).each do |id|
+                acts_as_list_list.find(id).increment!(position_column)
+              end
+            else
+              items.increment_all
+            end
           end
         end
 
@@ -352,20 +373,16 @@ module ActiveRecord
             if in_list?
               old_position = send(position_column).to_i
               return if position == old_position
-              shuffle_positions_on_intermediate_items(old_position, position)
+              # temporary move after bottom with gap, avoiding duplicate values
+              # gap is required to leave room for position increments
+              # positive number will be valid with unique not null check (>= 0) db constraint
+              tmp_position_after_everything = acts_as_list_class.unscoped.maximum(position_column).to_i + 2
+              set_list_position(tmp_position_after_everything)
+              shuffle_positions_on_intermediate_items(old_position, position, id)
             else
               increment_positions_on_lower_items(position)
             end
             set_list_position(position)
-          end
-        end
-
-        # used by insert_at_position instead of remove_from_list, as postgresql raises error if position_column has non-null constraint
-        def store_at_0
-          if in_list?
-            old_position = send(position_column).to_i
-            set_list_position(0)
-            decrement_positions_on_lower_items(old_position)
           end
         end
 
